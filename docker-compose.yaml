@@ -1,0 +1,23 @@
+services:
+  otel-collector:
+    # contrib 版は basicauth extension / grafanacloud connector を含むため必須
+    # 上げるときは https://github.com/open-telemetry/opentelemetry-collector-releases/releases を参照
+    image: otel/opentelemetry-collector-contrib:0.151.0
+    container_name: otel-collector
+    # コンテナ内の設定ファイルパスを引数で明示する
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    # Grafana Cloud の接続情報(エンドポイント / instance_id / API key 等)を .env から読み込む
+    # 設定ファイル中の ${env:VAR} はここで渡された環境変数を参照する
+    env_file:
+      - .env
+    volumes:
+      # ホスト側の設定ファイルをそのまま読み込ませる(:ro = 読み取り専用マウント)
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC レシーバー(SDK からの送信先)
+      - "4318:4318"   # OTLP HTTP レシーバー(SDK からの送信先)
+      - "8888:8888"   # Collector 自身の動作メトリクス(ローカル確認用 Prometheus 形式)
+      - "13133:13133" # health_check
+      - "55679:55679" # zPages デバッグ UI
+    # Docker デーモン再起動やクラッシュ時の自動復帰(手動 stop は対象外)
+    restart: unless-stopped

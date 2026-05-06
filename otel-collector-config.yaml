@@ -1,0 +1,112 @@
+# OpenTelemetry Collector 設定 (Grafana Cloud 送信版)
+# ベース: https://github.com/grafana/opentelemetry-onboarding/blob/main/linux/collector.yaml
+# Linux ホスト前提の receiver (journald, hostmetrics) はコンテナ運用に合わないため削除済み
+
+# receivers: テレメトリの入口
+receivers:
+  # アプリ側の OTel SDK からはここへ送る(gRPC:4317 / HTTP:4318)
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+# extensions: パイプライン外の補助機能
+extensions:
+  # basicauth: Grafana Cloud は instance_id をユーザー名、API トークンをパスワードとして Basic 認証する
+  # 値は service.extensions に登録し、exporter から authenticator として参照することで適用される
+  basicauth/grafana_cloud:
+    client_auth:
+      username: "${env:GRAFANA_CLOUD_INSTANCE_ID}"
+      password: "${env:GRAFANA_CLOUD_API_KEY}"
+  # コンテナの生存確認用 HTTP エンドポイント
+  health_check:
+    endpoint: 0.0.0.0:13133
+  # Collector 内部状態のデバッグ UI: http://localhost:55679/debug/servicez など
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+# processors: 受信データに対する加工
+processors:
+  # memory_limiter: 上限を超えそうになると新規データを drop しメモリ枯渇を防ぐ。本番では必須級
+  memory_limiter:
+    check_interval: 5s          # この間隔でメモリ使用量を監視
+    limit_percentage: 80        # 全体メモリの80%超で drop 開始
+    spike_limit_percentage: 25  # 短時間スパイク許容幅(80-25=55%超だとソフト drop)
+  # resourcedetection: 環境変数やシステム情報から resource attribute(host.name など)を補完する
+  resourcedetection:
+    detectors: [env, system]
+  # transform/promote_metric_attributes: resource にしか付かない host.name を datapoint 側にも複製
+  # Grafana Cloud のダッシュボードでホスト単位フィルタが効きやすくなる
+  transform/promote_metric_attributes:
+    metric_statements:
+      - set(datapoint.attributes["host.name"],resource.attributes["host.name"])
+  # deltatocumulative: Delta temporality のメトリクスを Cumulative に変換する
+  # Grafana Cloud OTLP gateway は Cumulative のみ受け付けるため必須
+  deltatocumulative:
+    max_stale: 5m
+
+# exporters: データの出口
+exporters:
+  # otlphttp/grafana_cloud: Grafana Cloud OTLP gateway へ HTTP/protobuf で送信
+  # endpoint は環境変数で注入(例: https://otlp-gateway-prod-ap-northeast-0.grafana.net/otlp)
+  otlphttp/grafana_cloud:
+    endpoint: "${env:GRAFANA_CLOUD_OTLP_ENDPOINT}"
+    auth:
+      authenticator: basicauth/grafana_cloud
+  # debug: Collector の標準出力にもダンプしておくとローカル動作確認が楽
+  debug:
+    verbosity: normal  # detailed にすると属性まで全部出るが非常に冗長
+
+# connectors: pipeline 同士をつなぐ特殊コンポーネント(receiver と exporter の両方を兼ねる)
+connectors:
+  # grafanacloud connector: traces を入力に取り、Application Observability 用の派生メトリクスを生成する
+  # traces パイプラインの出力先として登録 → metrics パイプラインの receiver として再利用、という流れ
+  grafanacloud/connector:
+    host_identifiers: ["host.id", "k8s.node.uid", "k8s.node.name", "host.name"]
+
+# service: 上で定義したコンポーネントを実際にどう使うかを宣言
+service:
+  # ここに書いた extension のみ起動する
+  extensions: [basicauth/grafana_cloud, health_check, zpages]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection]
+      # Grafana Cloud に送りつつ、connector へも流して metrics 派生に使う
+      exporters: [otlphttp/grafana_cloud, grafanacloud/connector, debug]
+    metrics:
+      # otlp(アプリ由来) と grafanacloud connector(traces 由来) の両方を受ける
+      receivers: [otlp, grafanacloud/connector]
+      processors: [memory_limiter, resourcedetection, deltatocumulative, transform/promote_metric_attributes]
+      exporters: [otlphttp/grafana_cloud, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection]
+      exporters: [otlphttp/grafana_cloud, debug]
+  # Collector 自身のテレメトリも Grafana Cloud に送る(Collector の健全性監視)
+  # GRAFANA_CLOUD_BASIC_AUTH_HEADER は事前に "Basic <base64(instance_id:api_key)>" を計算して .env に設定する
+  telemetry:
+    resource:
+      host.name: "${env:HOSTNAME}"
+    metrics:
+      readers:
+        - periodic:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: "${env:GRAFANA_CLOUD_OTLP_ENDPOINT}/v1/metrics"
+                headers:
+                  - name: "authorization"
+                    value: "${env:GRAFANA_CLOUD_BASIC_AUTH_HEADER}"
+    logs:
+      processors:
+        - batch:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: "${env:GRAFANA_CLOUD_OTLP_ENDPOINT}/v1/logs"
+                headers:
+                  - name: "authorization"
+                    value: "${env:GRAFANA_CLOUD_BASIC_AUTH_HEADER}"
